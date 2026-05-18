@@ -1,6 +1,6 @@
 [package]
 name = "maxio"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 description = "S3-compatible object storage server — single-binary replacement for MinIO"
 license = "Apache-2.0"
@@ -55,6 +55,8 @@ rust-embed = "8"
 mime_guess = "2"
 rand = "0.10.0"
 reed-solomon-erasure = "6"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

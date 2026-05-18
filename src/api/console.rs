@@ -3,12 +3,12 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, Request, State},
+    Json, Router,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::signature_v4;
 use crate::server::AppState;
+use crate::storage::filesystem::FilesystemStorage;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -48,7 +49,9 @@ impl LoginRateLimiter {
         let now = Instant::now();
 
         // Prune expired entries to prevent unbounded memory growth
-        map.retain(|_, b| now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2);
+        map.retain(|_, b| {
+            now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
+        });
 
         let bucket = map.entry(ip.to_string()).or_insert(Bucket {
             count: 0,
@@ -73,18 +76,16 @@ impl LoginRateLimiter {
 }
 
 fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string())
+    let _ = headers;
+    // Public console: do not trust spoofable X-Forwarded-For unless/until a
+    // trusted-proxy allowlist is configured. Use the connected peer IP.
+    addr.ip().to_string()
 }
 
 fn generate_token(access_key: &str, secret_key: &str, issued_at: i64) -> String {
     let issued_hex = format!("{:x}", issued_at);
-    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
     format!("{}.{}", issued_hex, sig)
@@ -104,8 +105,8 @@ fn verify_token(token: &str, access_key: &str, secret_key: &str) -> bool {
         return false;
     }
 
-    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
 
@@ -128,21 +129,16 @@ fn extract_cookie(headers: &HeaderMap) -> Option<String> {
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
-            cookies.split(';')
+            cookies
+                .split(';')
                 .map(|c| c.trim())
                 .find(|c| c.starts_with(&format!("{}=", COOKIE_NAME)))
                 .map(|c| c[COOKIE_NAME.len() + 1..].to_string())
         })
 }
 
-fn make_cookie(value: &str, max_age: i64, request_headers: &HeaderMap) -> String {
-    let is_secure = request_headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false);
-
-    let secure_flag = if is_secure { "; Secure" } else { "" };
+fn make_cookie(value: &str, max_age: i64, secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
 
     format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
@@ -160,7 +156,11 @@ async fn console_auth_middleware(
         .unwrap_or(false);
 
     if !authenticated {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Not authenticated"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Not authenticated"})),
+        )
+            .into_response();
     }
     next.run(request).await
 }
@@ -190,8 +190,14 @@ pub async fn login(
     }
 
     // Use constant-time comparison to prevent timing side-channel attacks
-    let key_match = constant_time_eq(body.access_key.as_bytes(), state.config.access_key.as_bytes());
-    let secret_match = constant_time_eq(body.secret_key.as_bytes(), state.config.secret_key.as_bytes());
+    let key_match = constant_time_eq(
+        body.access_key.as_bytes(),
+        state.config.access_key.as_bytes(),
+    );
+    let secret_match = constant_time_eq(
+        body.secret_key.as_bytes(),
+        state.config.secret_key.as_bytes(),
+    );
     if !key_match || !secret_match {
         return (
             StatusCode::UNAUTHORIZED,
@@ -202,18 +208,24 @@ pub async fn login(
 
     let now = chrono::Utc::now().timestamp();
     let token = generate_token(&state.config.access_key, &state.config.secret_key, now);
-    let cookie = make_cookie(&token, TOKEN_MAX_AGE_SECS, &headers);
+    let cookie = make_cookie(
+        &token,
+        TOKEN_MAX_AGE_SECS,
+        state.config.secure_cookies && !state.config.allow_insecure_dev,
+    );
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
 
-    (StatusCode::OK, resp_headers, Json(serde_json::json!({"ok": true}))).into_response()
+    (
+        StatusCode::OK,
+        resp_headers,
+        Json(serde_json::json!({"ok": true})),
+    )
+        .into_response()
 }
 
-pub async fn check(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let authenticated = extract_cookie(&headers)
         .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
         .unwrap_or(false);
@@ -221,30 +233,128 @@ pub async fn check(
     if authenticated {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Not authenticated"})))
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Not authenticated"})),
+        )
     }
 }
 
-pub async fn logout(headers: HeaderMap) -> impl IntoResponse {
-    let cookie = make_cookie("", 0, &headers);
+pub async fn logout(State(state): State<AppState>) -> impl IntoResponse {
+    let cookie = make_cookie(
+        "",
+        0,
+        state.config.secure_cookies && !state.config.allow_insecure_dev,
+    );
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-    (StatusCode::OK, resp_headers, Json(serde_json::json!({"ok": true})))
+    (
+        StatusCode::OK,
+        resp_headers,
+        Json(serde_json::json!({"ok": true})),
+    )
 }
 
-pub async fn list_buckets(
+async fn console_csrf_middleware(
     State(state): State<AppState>,
-) -> impl IntoResponse {
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let mutating = matches!(
+        method,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    );
+    if mutating {
+        let headers = request.headers();
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let origin = headers
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| headers.get("referer").and_then(|v| v.to_str().ok()));
+        if let Some(origin) = origin {
+            if !same_origin_host(origin, host) && !dev_loopback_origin_allowed(&state, origin, host)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "CSRF origin check failed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let mut response = next.run(request).await;
+    apply_security_headers(response.headers_mut());
+    response
+}
+
+fn same_origin_host(origin_or_referer: &str, host: &str) -> bool {
+    origin_host(origin_or_referer)
+        .map(|h| h.eq_ignore_ascii_case(host))
+        .unwrap_or(false)
+}
+
+fn dev_loopback_origin_allowed(state: &AppState, origin_or_referer: &str, host: &str) -> bool {
+    state.config.allow_insecure_dev
+        && origin_host(origin_or_referer)
+            .map(|origin_host| is_loopback_host(origin_host) && is_loopback_host(host))
+            .unwrap_or(false)
+}
+
+fn origin_host(origin_or_referer: &str) -> Option<&str> {
+    origin_or_referer
+        .strip_prefix("https://")
+        .or_else(|| origin_or_referer.strip_prefix("http://"))
+        .and_then(|rest| rest.split('/').next())
+}
+
+fn is_loopback_host(host_with_optional_port: &str) -> bool {
+    let host = host_with_optional_port
+        .strip_prefix('[')
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or_else(|| {
+            host_with_optional_port
+                .split(':')
+                .next()
+                .unwrap_or(host_with_optional_port)
+        });
+
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn apply_security_headers(headers: &mut HeaderMap) {
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("referrer-policy", "same-origin".parse().unwrap());
+    headers.insert("x-frame-options", "DENY".parse().unwrap());
+}
+
+pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     match state.storage.list_buckets().await {
         Ok(buckets) => {
-            let list: Vec<serde_json::Value> = buckets.into_iter().map(|b| {
-                serde_json::json!({ "name": b.name, "createdAt": b.created_at, "versioning": b.versioning })
-            }).collect();
+            let list: Vec<serde_json::Value> = buckets
+                .into_iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "name": b.name,
+                        "createdAt": b.created_at,
+                        "versioning": b.versioning,
+                        "encryption": b.encryption_config.is_some(),
+                    })
+                })
+                .collect();
             (StatusCode::OK, Json(serde_json::json!({ "buckets": list }))).into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -257,19 +367,39 @@ pub async fn create_bucket(
     State(state): State<AppState>,
     Json(body): Json<CreateBucketRequest>,
 ) -> impl IntoResponse {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    if crate::storage::validate_bucket_name(&body.name).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid bucket name"})),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
     let meta = crate::storage::BucketMeta {
         name: body.name.clone(),
         created_at: now,
         region: state.config.region.clone(),
         versioning: false,
         cors_rules: None,
+        encryption_config: None,
+        public_read: false,
+        public_list: false,
     };
 
     match state.storage.create_bucket(&meta).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(false) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": "Bucket already exists"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Bucket already exists"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -279,11 +409,21 @@ pub async fn delete_bucket_api(
 ) -> impl IntoResponse {
     match state.storage.delete_bucket(&bucket).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Bucket not found"}))).into_response(),
-        Err(crate::storage::StorageError::BucketNotEmpty) => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({"error": "Bucket is not empty"}))).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Bucket not found"})),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::BucketNotEmpty) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Bucket is not empty"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -300,8 +440,20 @@ pub async fn list_objects(
 ) -> impl IntoResponse {
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
-        Ok(false) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Bucket not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Bucket not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     }
 
     let prefix = params.prefix.unwrap_or_default();
@@ -310,7 +462,11 @@ pub async fn list_objects(
     let all_objects = match state.storage.list_objects(&bucket, &prefix).await {
         Ok(objects) => objects,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
 
@@ -335,9 +491,9 @@ pub async fn list_objects(
     // Determine which prefixes are empty (only contain a folder marker, no real objects)
     let mut empty_prefixes: Vec<&String> = Vec::new();
     for p in &prefix_set {
-        let has_children = all_objects.iter().any(|obj| {
-            obj.key.starts_with(p.as_str()) && obj.key != *p
-        });
+        let has_children = all_objects
+            .iter()
+            .any(|obj| obj.key.starts_with(p.as_str()) && obj.key != *p);
         if !has_children {
             empty_prefixes.push(p);
         }
@@ -345,11 +501,15 @@ pub async fn list_objects(
 
     let prefixes: Vec<&String> = prefix_set.iter().collect();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "files": files,
-        "prefixes": prefixes,
-        "emptyPrefixes": empty_prefixes,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "files": files,
+            "prefixes": prefixes,
+            "emptyPrefixes": empty_prefixes,
+        })),
+    )
+        .into_response()
 }
 
 pub async fn upload_object(
@@ -360,8 +520,20 @@ pub async fn upload_object(
 ) -> impl IntoResponse {
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
-        Ok(false) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Bucket not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Bucket not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     }
 
     let content_type = headers
@@ -374,13 +546,46 @@ pub async fn upload_object(
         stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     );
 
-    match state.storage.put_object(&bucket, &key, content_type, Box::pin(reader), None).await {
-        Ok(result) => (StatusCode::OK, Json(serde_json::json!({
-            "ok": true,
-            "etag": result.etag,
-            "size": result.size,
-        }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    let encryption = match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(Some(cfg)) => Some(crate::api::object::encryption_from_bucket_default(&cfg)),
+        Ok(None) => None,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to read bucket encryption: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match state
+        .storage
+        .put_object(
+            &bucket,
+            &key,
+            content_type,
+            Box::pin(reader),
+            None,
+            encryption,
+        )
+        .await
+    {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "etag": result.etag,
+                "size": result.size,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -388,20 +593,103 @@ pub async fn delete_object_api(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match state.storage.delete_object(&bucket, &key).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Bucket not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     }
+
+    match state.storage.delete_object(&bucket, &key).await {
+        Ok(_) => {
+            if let Err(e) =
+                preserve_empty_parent_folder_after_object_delete(&state.storage, &bucket, &key)
+                    .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn parent_folder_prefix_for_deleted_object(key: &str) -> Option<String> {
+    if key.ends_with('/') {
+        return None;
+    }
+    key.rfind('/')
+        .map(|idx| key[..=idx].to_string())
+        .filter(|prefix| !prefix.is_empty())
+}
+
+async fn preserve_empty_parent_folder_after_object_delete(
+    storage: &FilesystemStorage,
+    bucket: &str,
+    key: &str,
+) -> Result<(), String> {
+    let Some(parent_prefix) = parent_folder_prefix_for_deleted_object(key) else {
+        return Ok(());
+    };
+
+    let remaining = storage
+        .list_objects(bucket, &parent_prefix)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let parent_still_exists = remaining.iter().any(|obj| {
+        obj.key == parent_prefix
+            || (obj.key.starts_with(&parent_prefix) && obj.key != parent_prefix)
+    });
+    if parent_still_exists {
+        return Ok(());
+    }
+
+    storage
+        .put_object(
+            bucket,
+            &parent_prefix,
+            "application/x-directory",
+            Box::pin(tokio::io::empty()),
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 pub async fn download_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
-    let (reader, meta) = match state.storage.get_object(&bucket, &key).await {
+    let (reader, meta) = match state.storage.get_object(&bucket, &key, None).await {
         Ok(r) => r,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Object not found"}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Object not found"})),
+            )
+                .into_response();
         }
     };
 
@@ -414,7 +702,10 @@ pub async fn download_object(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", safe_filename),
+        )
         .body(body)
         .unwrap()
         .into_response()
@@ -447,7 +738,7 @@ pub async fn presign_object(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Object not found"})),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -567,7 +858,31 @@ pub async fn create_folder(
     }
 
     let key = format!("{}/", name);
-    match state.storage.put_object(&bucket, &key, "application/x-directory", Box::pin(tokio::io::empty()), None).await {
+    let encryption = match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(Some(cfg)) => Some(crate::api::object::encryption_from_bucket_default(&cfg)),
+        Ok(None) => None,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to read bucket encryption: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .storage
+        .put_object(
+            &bucket,
+            &key,
+            "application/x-directory",
+            Box::pin(tokio::io::empty()),
+            None,
+            encryption,
+        )
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -582,8 +897,16 @@ pub async fn get_versioning(
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
     match state.storage.is_versioned(&bucket).await {
-        Ok(enabled) => (StatusCode::OK, Json(serde_json::json!({"enabled": enabled}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(enabled) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"enabled": enabled})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -599,7 +922,111 @@ pub async fn set_versioning(
 ) -> impl IntoResponse {
     match state.storage.set_versioning(&bucket, body.enabled).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(Some(cfg)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": true,
+                "algorithm": cfg.sse_algorithm,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": false,
+                "algorithm": null,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetEncryptionRequest {
+    enabled: bool,
+}
+
+pub async fn set_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<SetEncryptionRequest>,
+) -> impl IntoResponse {
+    let result = if body.enabled {
+        let cfg = crate::storage::BucketEncryptionConfig {
+            sse_algorithm: "AES256".to_string(),
+        };
+        state.storage.put_bucket_encryption(&bucket, cfg).await
+    } else {
+        state.storage.delete_bucket_encryption(&bucket).await
+    };
+    match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_public(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    match state.storage.get_bucket_public(&bucket).await {
+        Ok((read, list)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"read": read, "list": list})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetPublicRequest {
+    read: bool,
+    list: bool,
+}
+
+pub async fn set_public(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<SetPublicRequest>,
+) -> impl IntoResponse {
+    match state
+        .storage
+        .set_bucket_public(&bucket, body.read, body.list)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -613,9 +1040,19 @@ pub async fn list_versions(
     Path(bucket): Path<String>,
     Query(params): Query<ListVersionsParams>,
 ) -> impl IntoResponse {
-    let all = match state.storage.list_object_versions(&bucket, &params.key).await {
+    let all = match state
+        .storage
+        .list_object_versions(&bucket, &params.key)
+        .await
+    {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     };
 
     // Filter to only versions matching this exact key
@@ -633,16 +1070,28 @@ pub async fn list_versions(
         })
         .collect();
 
-    (StatusCode::OK, Json(serde_json::json!({"versions": versions}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"versions": versions})),
+    )
+        .into_response()
 }
 
 pub async fn delete_version(
     State(state): State<AppState>,
     Path((bucket, version_id, key)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    match state.storage.delete_object_version(&bucket, &key, &version_id).await {
+    match state
+        .storage
+        .delete_object_version(&bucket, &key, &version_id)
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -650,10 +1099,18 @@ pub async fn download_version(
     State(state): State<AppState>,
     Path((bucket, version_id, key)): Path<(String, String, String)>,
 ) -> Response {
-    let (reader, meta) = match state.storage.get_object_version(&bucket, &key, &version_id).await {
+    let (reader, meta) = match state
+        .storage
+        .get_object_version(&bucket, &key, &version_id, None)
+        .await
+    {
         Ok(r) => r,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Version not found"}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Version not found"})),
+            )
+                .into_response();
         }
     };
 
@@ -666,37 +1123,174 @@ pub async fn download_version(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", safe_filename),
+        )
         .body(body)
         .unwrap()
         .into_response()
 }
 
 pub fn console_router(state: AppState) -> Router<AppState> {
+    let json_body_limit = DefaultBodyLimit::max(state.config.max_console_body_bytes);
+
     let public = Router::new()
         .route("/auth/login", post(login))
-        .route("/auth/check", get(check));
+        .route("/auth/check", get(check))
+        .layer(json_body_limit);
 
-    let protected = Router::new()
+    let protected_limited = Router::new()
         .route("/auth/logout", post(logout))
         .route("/buckets", get(list_buckets))
         .route("/buckets", post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket_api))
         .route("/buckets/{bucket}/folders", post(create_folder))
         .route("/buckets/{bucket}/objects", get(list_objects))
-        .route("/buckets/{bucket}/objects/{*key}", delete(delete_object_api))
-        .route("/buckets/{bucket}/upload/{*key}", put(upload_object))
+        .route(
+            "/buckets/{bucket}/objects/{*key}",
+            delete(delete_object_api),
+        )
         .route("/buckets/{bucket}/download/{*key}", get(download_object))
         .route("/buckets/{bucket}/presign/{*key}", get(presign_object))
         .route("/buckets/{bucket}/versioning", get(get_versioning))
         .route("/buckets/{bucket}/versioning", put(set_versioning))
+        .route("/buckets/{bucket}/encryption", get(get_encryption))
+        .route("/buckets/{bucket}/encryption", put(set_encryption))
+        .route("/buckets/{bucket}/public", get(get_public))
+        .route("/buckets/{bucket}/public", put(set_public))
         .route("/buckets/{bucket}/versions", get(list_versions))
-        .route("/buckets/{bucket}/versions/{version_id}/objects/{*key}", delete(delete_version))
-        .route("/buckets/{bucket}/versions/{version_id}/download/{*key}", get(download_version))
+        .route(
+            "/buckets/{bucket}/versions/{version_id}/objects/{*key}",
+            delete(delete_version),
+        )
+        .route(
+            "/buckets/{bucket}/versions/{version_id}/download/{*key}",
+            get(download_version),
+        )
+        .layer(json_body_limit);
+
+    let protected_streaming =
+        Router::new().route("/buckets/{bucket}/upload/{*key}", put(upload_object));
+
+    let protected = protected_limited
+        .merge(protected_streaming)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            console_csrf_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state,
             console_auth_middleware,
         ));
 
     public.merge(protected)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::storage::keys::Keyring;
+    use crate::storage::{BucketMeta, ByteStream};
+
+    use super::*;
+
+    async fn test_storage(data_dir: &str) -> Result<FilesystemStorage, Box<dyn std::error::Error>> {
+        let keyring = Arc::new(Keyring::load(data_dir, None).await?);
+        Ok(FilesystemStorage::new(data_dir, false, 10 * 1024 * 1024, 0, keyring).await?)
+    }
+
+    async fn create_test_bucket(storage: &FilesystemStorage, bucket: &str) {
+        storage
+            .create_bucket(&BucketMeta {
+                name: bucket.to_string(),
+                created_at: "2026-05-18T00:00:00.000Z".to_string(),
+                region: "us-east-1".to_string(),
+                versioning: false,
+                cors_rules: None,
+                encryption_config: None,
+                public_read: false,
+                public_list: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn bytes(data: &'static [u8]) -> ByteStream {
+        Box::pin(data)
+    }
+
+    #[test]
+    fn parent_folder_prefix_ignores_root_files_and_folder_markers() {
+        assert_eq!(parent_folder_prefix_for_deleted_object("file.txt"), None);
+        assert_eq!(parent_folder_prefix_for_deleted_object("folder/"), None);
+        assert_eq!(
+            parent_folder_prefix_for_deleted_object("folder/file.txt"),
+            Some("folder/".to_string())
+        );
+        assert_eq!(
+            parent_folder_prefix_for_deleted_object("a/b/file.txt"),
+            Some("a/b/".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_last_console_file_preserves_parent_folder_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path().to_str().unwrap()).await.unwrap();
+        create_test_bucket(&storage, "bucket").await;
+
+        storage
+            .put_object(
+                "bucket",
+                "folder/file.txt",
+                "text/plain",
+                bytes(b"hello"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        storage
+            .delete_object("bucket", "folder/file.txt")
+            .await
+            .unwrap();
+        preserve_empty_parent_folder_after_object_delete(&storage, "bucket", "folder/file.txt")
+            .await
+            .unwrap();
+
+        let objects = storage.list_objects("bucket", "folder/").await.unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "folder/");
+        assert_eq!(objects[0].content_type, "application/x-directory");
+    }
+
+    #[tokio::test]
+    async fn deleting_folder_marker_does_not_recreate_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = test_storage(temp.path().to_str().unwrap()).await.unwrap();
+        create_test_bucket(&storage, "bucket").await;
+
+        storage
+            .put_object(
+                "bucket",
+                "folder/",
+                "application/x-directory",
+                Box::pin(tokio::io::empty()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        storage.delete_object("bucket", "folder/").await.unwrap();
+        preserve_empty_parent_folder_after_object_delete(&storage, "bucket", "folder/")
+            .await
+            .unwrap();
+
+        let objects = storage.list_objects("bucket", "folder/").await.unwrap();
+        assert!(objects.is_empty());
+    }
 }

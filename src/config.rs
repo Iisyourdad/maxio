@@ -21,6 +21,10 @@ fn default_region() -> String {
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
+fn default_default_buckets() -> Option<String> {
+    first_env_value(&["MINIO_DEFAULT_BUCKETS"])
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Port to listen on
@@ -28,7 +32,7 @@ pub struct Config {
     pub port: u16,
 
     /// Address to bind to
-    #[arg(long, env = "MAXIO_ADDRESS", default_value = "0.0.0.0")]
+    #[arg(long, env = "MAXIO_ADDRESS", default_value = "127.0.0.1")]
     pub address: String,
 
     /// Root data directory
@@ -47,6 +51,19 @@ pub struct Config {
     #[arg(long, env = "MAXIO_REGION", default_value_t = default_region())]
     pub region: String,
 
+    /// Master key for SSE-S3 encryption (base64-encoded 32 bytes).
+    /// When set, takes precedence over the keyring file for new writes.
+    #[arg(long, env = "MAXIO_MASTER_KEY")]
+    pub master_key: Option<String>,
+
+    /// Allow insecure development defaults (default credentials, HTTP cookies).
+    #[arg(long, env = "MAXIO_ALLOW_INSECURE_DEV", default_value = "false")]
+    pub allow_insecure_dev: bool,
+
+    /// Force Secure on console session cookies. Keep enabled for public consoles.
+    #[arg(long, env = "MAXIO_SECURE_COOKIES", default_value = "true")]
+    pub secure_cookies: bool,
+
     /// Enable erasure coding with per-chunk integrity checksums
     #[arg(long, env = "MAXIO_ERASURE_CODING", default_value = "false")]
     pub erasure_coding: bool,
@@ -58,4 +75,13 @@ pub struct Config {
     /// Number of parity shards for erasure coding (0 = no parity, requires --erasure-coding)
     #[arg(long, env = "MAXIO_PARITY_SHARDS", default_value = "0")]
     pub parity_shards: u32,
+
+    /// Comma-separated list of bucket names to create on first boot
+    /// (MAXIO_DEFAULT_BUCKETS, MINIO_DEFAULT_BUCKETS)
+    #[arg(long, env = "MAXIO_DEFAULT_BUCKETS", default_value_t = default_default_buckets().unwrap_or_default())]
+    pub default_buckets: String,
+
+    /// Max request body size for console JSON/form API routes, in bytes. Object uploads are streaming and not covered by this limit.
+    #[arg(long, env = "MAXIO_MAX_CONSOLE_BODY_BYTES", default_value = "1048576")]
+    pub max_console_body_bytes: usize,
 }

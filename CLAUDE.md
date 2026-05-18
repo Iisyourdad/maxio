@@ -13,10 +13,8 @@ Always spell the product name **MaxIO** (capital M, capital I, capital O). Never
 ## Build & Run
 
 ```bash
-# Build frontend (required — assets are embedded into the binary)
-cd ui && bun run build && cd ..
-
-# Build binary
+# Build frontend (optional — cargo build also builds and embeds it)
+# Build binary (build.rs runs the UI build and embeds it)
 cargo build --release
 ./target/release/maxio --data-dir ./data --port 9000
 ```
@@ -31,17 +29,17 @@ The release binary is fully self-contained — the frontend UI is embedded at co
 # 1. Install frontend dependencies
 cd ui && bun install
 
-# 2. Build frontend (outputs to ui/dist/, required before cargo build)
+# 2. Build frontend (outputs to ui/build/; cargo build also does this automatically)
 bun run build && cd ..
 
 # 3. Build optimized binary
 cargo build --release
 
 # Result: single binary at ./target/release/maxio
-# Copy it anywhere — no ui/dist/ or other files needed at runtime
+# Copy it anywhere — no ui/build/ or other files needed at runtime
 ```
 
-The binary serves the web console at `/ui/` with proper MIME types, ETags, and cache headers (immutable for hashed assets, no-store for `index.html`).
+The binary serves the web console at `/ui/` with proper MIME types, ETags, and cache headers (immutable for hashed assets, no-store for `200.html` / HTML shell).
 
 Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
 
@@ -55,12 +53,7 @@ Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
 # 1. Unit + integration tests (always run first, no server needed)
 cargo test
 
-# 2. mc integration tests (start server, run tests, stop server)
-cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
-./tests/mc_test.sh 9876 /tmp/maxio-test
-kill %1 && rm -rf /tmp/maxio-test
-
-# 3. AWS CLI integration tests (start server, run tests, stop server)
+# 2. AWS CLI integration tests (start server, run tests, stop server)
 cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
 ./tests/aws_cli_test.sh 9876 /tmp/maxio-test
 kill %1 && rm -rf /tmp/maxio-test
@@ -69,12 +62,12 @@ kill %1 && rm -rf /tmp/maxio-test
 **Hot-reload dev server** (for manual testing):
 
 ```bash
-just dev
+bun run dev
 ```
 
 This runs both processes concurrently (Ctrl+C kills both):
-- `cargo watch` — rebuilds and restarts the Rust server on changes
-- `bun run build --watch` — rebuilds `ui/dist/` on frontend changes
+- `cargo watch` — rebuilds and restarts the Rust server on backend changes
+- Vite dev server — serves the UI with HMR at `http://127.0.0.1:5173/ui/` and proxies `/api` to the Rust server
 
 ## Architecture
 
@@ -95,7 +88,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 - **Storage layout**: `{data_dir}/buckets/{bucket-name}/{key-path}` for data, `{key-path}.meta.json` for metadata, `.bucket.json` for bucket metadata
 - **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
-- **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. In debug builds, assets are read from disk (`ui/dist/`) for live reload. In release builds, assets are baked in — single binary, no external files needed
+- **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. In debug builds, assets are read from the SvelteKit static build (`ui/build/`) when embedded; dev uses Vite/SvelteKit HMR. In release builds, assets are baked in — single binary, no external files needed
 - **Web console**: SPA at `/ui/`, API at `/api/`. Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
 
 ### Data Layout
@@ -143,6 +136,9 @@ This runs both processes concurrently (Ctrl+C kills both):
 | GetBucketCors | GET | `/{bucket}?cors` |
 | PutBucketCors | PUT | `/{bucket}?cors` |
 | DeleteBucketCors | DELETE | `/{bucket}?cors` |
+| GetBucketEncryption | GET | `/{bucket}?encryption` |
+| PutBucketEncryption | PUT | `/{bucket}?encryption` |
+| DeleteBucketEncryption | DELETE | `/{bucket}?encryption` |
 | CreateMultipartUpload | POST | `/{bucket}/{key}?uploads` |
 | UploadPart | PUT | `/{bucket}/{key}?partNumber=N&uploadId=X` |
 | UploadPartCopy | PUT | `/{bucket}/{key}?partNumber=N&uploadId=X` (with `x-amz-copy-source` header) |
@@ -166,6 +162,30 @@ This runs both processes concurrently (Ctrl+C kills both):
 | `/api/buckets/{bucket}/upload/{key}` | PUT | cookie | Upload object |
 | `/api/buckets/{bucket}/download/{key}` | GET | cookie | Download object |
 | `/api/buckets/{bucket}/presign/{key}` | GET | cookie | Generate presigned URL (`?expires=SECONDS`, default 3600, max 604800) |
+
+### Server-Side Encryption (SSE)
+
+MaxIO supports **SSE-S3** (server-managed keys) and **SSE-C** (customer-supplied keys) using AES-256-GCM with per-frame nonces (65,536-byte chunks). SSE-KMS is intentionally not supported and rejected with `InvalidEncryptionAlgorithm`.
+
+- **Per-object DEK**: Each object gets a fresh 256-bit Data Encryption Key. For SSE-S3, the DEK is wrapped by the active master key (AES-256-GCM) and stored alongside the object metadata. For SSE-C, the DEK is wrapped by the customer-supplied key submitted on every read.
+- **Sidecar integrity**: HMAC-SHA256 binds encryption metadata (key id, wrapped DEK, nonce prefix) to the object — tampering with the sidecar causes decryption to fail.
+- **Erasure coding composition**: When EC is enabled, plaintext is encrypted first, then the ciphertext is sharded across EC chunks. Range reads work transparently across encrypted EC chunks.
+- **Bucket default encryption**: `PutBucketEncryption` / `GetBucketEncryption` / `DeleteBucketEncryption` set a per-bucket default. Explicit `x-amz-server-side-encryption` headers on PUT override the default.
+- **Multipart**: One DEK per multipart session. SSE-C parts must submit the same customer key (validated via MD5) on every part.
+
+#### Master Key Management
+
+| Concern | Behavior |
+|---|---|
+| Bootstrap | First server start auto-generates a 32-byte master key in `<data-dir>/.maxio-keys.json` (file mode 0600 on Unix). Back this file up — losing it makes all SSE-S3 objects unrecoverable |
+| Override | Set `MAXIO_MASTER_KEY` (or `--master-key`) to a base64-encoded 32-byte key. Bypasses the on-disk keyring file |
+| Rotation | `maxio keyring rotate --data-dir <dir>` generates a new active key and demotes the previous active key (retained so existing objects keep decrypting). Restart the server to begin encrypting new objects with the new key. Existing objects remain readable; they do not get rewritten |
+| Inspection | `maxio keyring list --data-dir <dir>` prints key ids, creation times, and active flag (never the raw key material) |
+| Windows | `0600` file mode is only enforced on Unix — on Windows, restrict ACLs manually or use full-disk encryption |
+
+#### Backup & Recovery
+
+The `.maxio-keys.json` file is the single source of truth for SSE-S3 decryption. **Back it up offline** at the same time as the data directory. Loss of all keys in the ring = permanent data loss for SSE-S3 objects (this is by design — there is no escrow). For disaster recovery, copy the keyring file to the new host before restoring object data.
 
 ### Frontend Error Logging
 
@@ -220,10 +240,6 @@ aws --endpoint-url http://localhost:9000 s3 rb s3://test-bucket
 # Unit + integration tests (no server needed)
 cargo test
 
-# mc integration tests (requires running server)
-RUST_LOG=debug cargo watch -x 'run -- --data-dir ./data' &
-./tests/mc_test.sh
-
 # AWS CLI integration tests (requires running server)
 ./tests/aws_cli_test.sh
 ```
@@ -246,9 +262,9 @@ cargo build --release
 # Against external servers (skip automatic server management)
 ./tests/bench.sh --maxio-host=server1:9000 --minio-host=server2:9000
 
-# Via justfile
-just bench          # full (30s per scenario)
-just bench-quick    # quick smoke test
+# Via root package scripts
+bun run bench        # full (30s per scenario)
+bun run bench:quick  # quick smoke test
 ```
 
 **Remote server benchmark** (single command — cross-compiles, copies binary, auto-downloads warp + minio on the server, runs, streams results):
@@ -262,12 +278,12 @@ just bench-quick    # quick smoke test
 
 The web console (`ui/`) follows the Coolify design system. The full specification is in [`ui/DESIGN_SYSTEM.md`](ui/DESIGN_SYSTEM.md). Key points:
 
-- **Stack**: Svelte 5, Vite, Tailwind CSS v4, shadcn-svelte components
+- **Stack**: SvelteKit static SPA, Svelte 5, Vite, Tailwind CSS v4, shadcn-svelte components, TanStack Query
 - **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/app.css`
 - **Accent colors**: Coollabs purple `#6b16ed` (light) / warning yellow `#fcd452` (dark). Brand purple (`--color-brand`) is always `#6b16ed` regardless of theme
-- **Font**: Inter (Google Fonts)
+- **Font**: Geist Sans + Geist Mono via `@fontsource/geist-sans` / `@fontsource/geist-mono` (Inter fallback)
 - **Inputs**: Inset box-shadow system (4px colored left bar on focus), no standard borders — see `.input-cool` in `app.css`
-- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
+- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `highlighted`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
 - **Border radius**: `0.125rem` (2px) everywhere — set via `--radius` in `@theme inline`
 - **Sidebar**: Collapsible 224px → 56px icon-only, uses `--cool-sidebar-*` CSS variables
 

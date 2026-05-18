@@ -32,6 +32,8 @@ pub enum S3ErrorCode {
     NoSuchCORSConfiguration,
     PreconditionFailed,
     SignatureDoesNotMatch,
+    InvalidEncryptionAlgorithm,
+    ServerSideEncryptionConfigurationNotFound,
 }
 
 impl S3ErrorCode {
@@ -58,6 +60,10 @@ impl S3ErrorCode {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            Self::InvalidEncryptionAlgorithm => "InvalidEncryptionAlgorithmError",
+            Self::ServerSideEncryptionConfigurationNotFound => {
+                "ServerSideEncryptionConfigurationNotFoundError"
+            }
         }
     }
 
@@ -71,7 +77,8 @@ impl S3ErrorCode {
             | Self::NoSuchKey
             | Self::NoSuchUpload
             | Self::NoSuchVersion
-            | Self::NoSuchCORSConfiguration => StatusCode::NOT_FOUND,
+            | Self::NoSuchCORSConfiguration
+            | Self::ServerSideEncryptionConfigurationNotFound => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
@@ -162,7 +169,10 @@ impl S3Error {
     pub fn bad_checksum(algo: &str) -> Self {
         Self {
             code: S3ErrorCode::BadDigest,
-            message: format!("The {} checksum you specified did not match what we received.", algo),
+            message: format!(
+                "The {} checksum you specified did not match what we received.",
+                algo
+            ),
             resource: None,
         }
     }
@@ -186,8 +196,7 @@ impl S3Error {
     pub fn entity_too_small() -> Self {
         Self {
             code: S3ErrorCode::EntityTooSmall,
-            message:
-                "Your proposed upload is smaller than the minimum allowed object size.".into(),
+            message: "Your proposed upload is smaller than the minimum allowed object size.".into(),
             resource: None,
         }
     }
@@ -211,8 +220,9 @@ impl S3Error {
     pub fn signature_mismatch() -> Self {
         Self {
             code: S3ErrorCode::SignatureDoesNotMatch,
-            message: "The request signature we calculated does not match the signature you provided."
-                .into(),
+            message:
+                "The request signature we calculated does not match the signature you provided."
+                    .into(),
             resource: None,
         }
     }
@@ -262,6 +272,23 @@ impl S3Error {
             code: S3ErrorCode::PreconditionFailed,
             message: "At least one of the pre-conditions you specified did not hold.".into(),
             resource: None,
+        }
+    }
+
+    pub fn invalid_encryption_algorithm() -> Self {
+        Self {
+            code: S3ErrorCode::InvalidEncryptionAlgorithm,
+            message: "The encryption request you specified is not valid. Supported value: AES256."
+                .into(),
+            resource: None,
+        }
+    }
+
+    pub fn no_such_bucket_encryption(bucket: &str) -> Self {
+        Self {
+            code: S3ErrorCode::ServerSideEncryptionConfigurationNotFound,
+            message: "The server side encryption configuration was not found.".into(),
+            resource: Some(format!("/{}", bucket)),
         }
     }
 }

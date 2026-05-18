@@ -1,3 +1,20 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::redundant_closure,
+    clippy::redundant_pattern_matching,
+    clippy::needless_borrows_for_generic_args,
+    clippy::io_other_error,
+    clippy::if_same_then_else,
+    clippy::manual_pattern_char_comparison,
+    clippy::derivable_impls,
+    clippy::items_after_test_module,
+    clippy::overly_complex_bool_expr,
+    clippy::too_many_arguments,
+    clippy::new_without_default,
+    clippy::needless_bool,
+    clippy::collapsible_else_if
+)]
+
 mod api;
 mod auth;
 mod config;
@@ -23,7 +40,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "maxio",
     about = "S3-compatible object storage server",
-    version = env!("MAXIO_VERSION")
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,6 +52,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Start the HTTP/S3 server (default when no subcommand is provided)
+    Serve,
+
     /// Check server health by sending an HTTP GET request
     Healthcheck {
         /// Healthcheck endpoint URL
@@ -44,6 +64,29 @@ enum Commands {
         /// Timeout in milliseconds for connect/read operations
         #[arg(long, env = "MAXIO_HEALTHCHECK_TIMEOUT_MS", default_value = "2000")]
         timeout_ms: u64,
+    },
+
+    /// Manage the SSE-S3 master-key keyring
+    #[command(subcommand)]
+    Keyring(KeyringCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum KeyringCmd {
+    /// Generate a new master key, mark it active, and demote the previous
+    /// active key (retained so existing objects keep decrypting).
+    /// Restart the server after rotating to pick up the new active key.
+    Rotate {
+        /// Data directory containing .maxio-keys.json
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Print the keyring file contents (key ids + metadata, never the key
+    /// material itself).
+    List {
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
     },
 }
 
@@ -58,8 +101,17 @@ fn default_healthcheck_url() -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if let Some(Commands::Healthcheck { url, timeout_ms }) = cli.command {
-        return run_healthcheck(&url, timeout_ms).await;
+    match cli.command {
+        Some(Commands::Serve) | None => {}
+        Some(Commands::Healthcheck { url, timeout_ms }) => {
+            return run_healthcheck(&url, timeout_ms).await;
+        }
+        Some(Commands::Keyring(KeyringCmd::Rotate { ref data_dir })) => {
+            return run_keyring_rotate(data_dir).await;
+        }
+        Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
+            return run_keyring_list(data_dir).await;
+        }
     }
 
     tracing_subscriber::fmt()
@@ -70,12 +122,44 @@ async fn main() -> anyhow::Result<()> {
 
     let config = cli.config;
 
+    if config.access_key == "maxioadmin"
+        && config.secret_key == "maxioadmin"
+        && !config.allow_insecure_dev
+    {
+        anyhow::bail!(
+            "refusing to start with default credentials in production; set MAXIO_ACCESS_KEY/MAXIO_SECRET_KEY or use --allow-insecure-dev for local development"
+        );
+    }
+
+    tokio::fs::create_dir_all(&config.data_dir).await?;
+
+    // Build the SSE-S3 keyring (bootstrap a random master key on first run).
+    let keyring = Arc::new(
+        storage::keys::Keyring::load(&config.data_dir, config.master_key.as_deref()).await?,
+    );
+    if config.master_key.is_none() {
+        tracing::info!(
+            "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP)",
+            keyring.active_id(),
+            config.data_dir
+        );
+    } else {
+        tracing::info!(
+            "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY)",
+            keyring.active_id()
+        );
+    }
+
     let storage = storage::filesystem::FilesystemStorage::new(
         &config.data_dir,
         config.erasure_coding,
         config.chunk_size,
         config.parity_shards,
-    ).await?;
+        keyring.clone(),
+    )
+    .await?;
+
+    storage::provision_default_buckets(&storage, &config.default_buckets, &config.region).await;
 
     let state = server::AppState {
         storage: Arc::new(storage),
@@ -89,29 +173,43 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     if config.access_key == "maxioadmin" && config.secret_key == "maxioadmin" {
         tracing::warn!(
-            "WARNING: Using default credentials. Set MAXIO_ACCESS_KEY/MAXIO_SECRET_KEY (or MINIO_ROOT_USER/MINIO_ROOT_PASSWORD) for production use."
+            "WARNING: Using default credentials because insecure development mode is enabled."
         );
     }
 
-    tracing::info!("MaxIO v{} listening on {}", env!("MAXIO_VERSION"), addr);
+    tracing::info!("MaxIO v{} listening on {}", env!("CARGO_PKG_VERSION"), addr);
     tracing::info!("Access Key: {}", config.access_key);
     tracing::info!("Secret Key: [REDACTED]");
     tracing::info!("Data dir:   {}", config.data_dir);
     tracing::info!("Region:     {}", config.region);
     if config.erasure_coding {
-        tracing::info!("Erasure coding: enabled (chunk size: {}MB)", config.chunk_size / (1024 * 1024));
+        tracing::info!(
+            "Erasure coding: enabled (chunk size: {}MB)",
+            config.chunk_size / (1024 * 1024)
+        );
         if config.parity_shards > 0 {
-            tracing::info!("Parity shards: {} (can tolerate {} lost/corrupt chunks per object)", config.parity_shards, config.parity_shards);
+            tracing::info!(
+                "Parity shards: {} (can tolerate {} lost/corrupt chunks per object)",
+                config.parity_shards,
+                config.parity_shards
+            );
         }
     } else if config.parity_shards > 0 {
         tracing::warn!("--parity-shards ignored: requires --erasure-coding to be enabled");
     }
-    let display_host = if config.address == "0.0.0.0" { "localhost" } else { &config.address };
+    let display_host = if config.address == "0.0.0.0" {
+        "localhost"
+    } else {
+        &config.address
+    };
     tracing::info!("Web UI:     http://{}:{}/ui/", display_host, config.port);
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }
@@ -126,10 +224,7 @@ async fn run_healthcheck(url: &str, timeout_ms: u64) -> anyhow::Result<()> {
         .host()
         .ok_or_else(|| anyhow::anyhow!("healthcheck URL is missing host"))?;
     let port = uri.port_u16().unwrap_or(80);
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let timeout_duration = Duration::from_millis(timeout_ms);
 
     let mut stream: TcpStream = timeout(timeout_duration, TcpStream::connect((host, port)))
@@ -140,7 +235,7 @@ async fn run_healthcheck(url: &str, timeout_ms: u64) -> anyhow::Result<()> {
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: maxio-healthcheck/{}\r\n\r\n",
         path_and_query,
         host,
-        env!("MAXIO_VERSION")
+        env!("CARGO_PKG_VERSION")
     );
     timeout(timeout_duration, stream.write_all(request.as_bytes()))
         .await
@@ -168,6 +263,52 @@ async fn run_healthcheck(url: &str, timeout_ms: u64) -> anyhow::Result<()> {
     }
 
     anyhow::bail!("healthcheck failed with HTTP status {}", status_code);
+}
+
+async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
+    let result = storage::keys::rotate(data_dir).await?;
+    println!("✓ keyring rotated at {}/.maxio-keys.json", data_dir);
+    println!("  new active key id: {}", result.new_active_id);
+    match result.previous_active_id {
+        Some(prev) => println!(
+            "  previous active:   {} (retained for old-object decryption)",
+            prev
+        ),
+        None => println!("  previous active:   <none> (first key in ring)"),
+    }
+    println!("  total keys in ring: {}", result.total_keys);
+    println!();
+    println!("Restart the server to begin encrypting new objects with the new key.");
+    Ok(())
+}
+
+async fn run_keyring_list(data_dir: &str) -> anyhow::Result<()> {
+    let path = format!("{}/.maxio-keys.json", data_dir);
+    let data = match tokio::fs::read_to_string(&path).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("No keyring file yet at {}", path);
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // Minimal pretty-print: parse, strip key_b64 fields, show id/created/active.
+    let v: serde_json::Value = serde_json::from_str(&data)?;
+    let empty = Vec::new();
+    let entries = v.get("keys").and_then(|k| k.as_array()).unwrap_or(&empty);
+    println!("{:<20}  {:<26}  ACTIVE", "KEY_ID", "CREATED_AT");
+    for e in entries {
+        let id = e.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        let created = e.get("created_at").and_then(|x| x.as_str()).unwrap_or("?");
+        let active = e.get("active").and_then(|x| x.as_bool()).unwrap_or(false);
+        println!(
+            "{:<20}  {:<26}  {}",
+            id,
+            created,
+            if active { "yes" } else { "no" }
+        );
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

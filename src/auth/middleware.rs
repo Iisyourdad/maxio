@@ -27,6 +27,20 @@ pub async fn auth_middleware(
         return handle_presigned(&state, &method, &query, request, next).await;
     }
 
+    let has_auth_header = request.headers().get("authorization").is_some();
+
+    // Anonymous public-bucket access: no auth header, safe method, bucket flagged public.
+    if !has_auth_header
+        && is_public_bypass_allowed(&state, &method, request.uri().path(), &query).await
+    {
+        tracing::debug!(
+            "Public bucket bypass for {} {}",
+            method,
+            request.uri().path()
+        );
+        return Ok(next.run(request).await);
+    }
+
     let auth_header = match request.headers().get("authorization") {
         Some(h) => h
             .to_str()
@@ -37,7 +51,7 @@ pub async fn auth_middleware(
         }
     };
 
-    tracing::debug!("Authorization: {}", auth_header);
+    tracing::debug!("Authorization: <redacted>");
 
     let parsed = signature_v4::parse_authorization_header(auth_header)
         .map_err(|e| S3Error::access_denied(e))?;
@@ -78,16 +92,15 @@ pub async fn auth_middleware(
         let now = Utc::now().naive_utc();
         let skew = (now - request_time).num_seconds().unsigned_abs();
         if skew > 15 * 60 {
-            tracing::debug!(
-                "Request timestamp skew too large: {}s (max 900s)",
-                skew
-            );
+            tracing::debug!("Request timestamp skew too large: {}s (max 900s)", skew);
             return Err(S3Error::access_denied(
                 "RequestTimeTooSkewed: The difference between the request time and the current time is too large.",
             ));
         }
     } else {
-        return Err(S3Error::access_denied("Invalid or missing X-Amz-Date header"));
+        return Err(S3Error::access_denied(
+            "Invalid or missing X-Amz-Date header",
+        ));
     }
 
     let path = request.uri().path().to_string();
@@ -95,12 +108,7 @@ pub async fn auth_middleware(
     tracing::debug!("Verifying signature for {} {} ?{}", method, path, query);
 
     for h in &parsed.signed_headers {
-        let val = request
-            .headers()
-            .get(h.as_str())
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("<missing>");
-        tracing::debug!("  signed header '{}': '{}'", h, val);
+        tracing::debug!("  signed header '{}': {}", h, redact_header_value(h));
     }
 
     let valid = signature_v4::verify_signature(
@@ -123,6 +131,88 @@ pub async fn auth_middleware(
     Ok(response)
 }
 
+fn redact_header_value(name: &str) -> &'static str {
+    match name.to_ascii_lowercase().as_str() {
+        "authorization"
+        | "cookie"
+        | "x-amz-security-token"
+        | "x-amz-signature"
+        | "x-amz-server-side-encryption-customer-key"
+        | "x-amz-server-side-encryption-customer-key-md5"
+        | "x-amz-copy-source-server-side-encryption-customer-key"
+        | "x-amz-copy-source-server-side-encryption-customer-key-md5" => "<redacted>",
+        _ => "<present>",
+    }
+}
+
+/// Returns true when the request targets a public-bucket resource and is a safe read.
+/// Bypass rules:
+///   - Method must be GET, HEAD, or OPTIONS.
+///   - Path must be `/{bucket}` (list) or `/{bucket}/{key}` (object).
+///   - For bucket-level path: `public_list` must be true.
+///   - For object path: `public_read` must be true.
+///   - Query must not contain mutating sub-resources (`delete`, `uploads`, `tagging`,
+///     `versioning`, `cors`, `encryption`, `policy`, `acl`).
+async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, query: &str) -> bool {
+    match method {
+        "GET" | "HEAD" | "OPTIONS" => {}
+        _ => return false,
+    }
+
+    // Reject mutating sub-resource queries that could trigger a POST-like action on GET.
+    for forbidden in [
+        "delete",
+        "uploads",
+        "tagging",
+        "versioning",
+        "cors",
+        "encryption",
+        "policy",
+        "acl",
+    ] {
+        if has_query_key(query, forbidden) {
+            return false;
+        }
+    }
+
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return false; // root listing always requires auth
+    }
+
+    let (bucket, rest) = match trimmed.split_once('/') {
+        Some((b, r)) => (b, r),
+        None => (trimmed, ""),
+    };
+
+    if bucket.is_empty() {
+        return false;
+    }
+
+    let (public_read, public_list) = match state.storage.get_bucket_public(bucket).await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    if rest.is_empty() {
+        // Bucket-level request: list/head bucket, location, etc.
+        public_list
+    } else {
+        // Object-level request.
+        public_read
+    }
+}
+
+fn has_query_key(query: &str, key: &str) -> bool {
+    for pair in query.split('&') {
+        let name = pair.split('=').next().unwrap_or("");
+        if name.eq_ignore_ascii_case(key) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn handle_presigned(
     state: &AppState,
     method: &str,
@@ -132,8 +222,8 @@ async fn handle_presigned(
 ) -> Result<Response, S3Error> {
     tracing::debug!("Presigned URL detected");
 
-    let (parsed, timestamp, expires_secs) = signature_v4::parse_presigned_query(query)
-        .map_err(|e| S3Error::access_denied(e))?;
+    let (parsed, timestamp, expires_secs) =
+        signature_v4::parse_presigned_query(query).map_err(|e| S3Error::access_denied(e))?;
 
     if parsed.access_key != state.config.access_key {
         return Err(S3Error::invalid_access_key());
@@ -146,18 +236,32 @@ async fn handle_presigned(
     // Check expiration
     let issued_at = NaiveDateTime::parse_from_str(&timestamp, "%Y%m%dT%H%M%SZ")
         .map_err(|_| S3Error::access_denied("Invalid X-Amz-Date format"))?;
-    let expires_at = issued_at
-        + chrono::Duration::seconds(expires_secs as i64);
+    let expires_at = issued_at + chrono::Duration::seconds(expires_secs as i64);
     let now = Utc::now().naive_utc();
 
     if now > expires_at {
-        tracing::debug!("Presigned URL expired: issued={}, expires={}, now={}", issued_at, expires_at, now);
+        tracing::debug!(
+            "Presigned URL expired: issued={}, expires={}, now={}",
+            issued_at,
+            expires_at,
+            now
+        );
         return Err(S3Error::expired_presigned_url());
+    }
+    if issued_at > now + chrono::Duration::minutes(15) {
+        return Err(S3Error::access_denied(
+            "X-Amz-Date is too far in the future",
+        ));
     }
 
     let path = request.uri().path().to_string();
 
-    tracing::debug!("Verifying presigned signature for {} {} ?{}", method, path, query);
+    tracing::debug!(
+        "Verifying presigned signature for {} {} ?{}",
+        method,
+        path,
+        query
+    );
 
     let valid = signature_v4::verify_presigned_signature(
         method,
